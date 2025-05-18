@@ -1,0 +1,134 @@
+name: Flutter iOS Build and Publish
+on:
+  workflow_dispatch: # Allows manual triggering of the workflow
+    inputs:
+      package_name:
+        description: "iOS bundle identifier"
+        required: true
+        default: "com.example.couldai_user_app"
+jobs:
+  flutter_ios_build_publish:
+    runs-on: macos-latest
+    steps: 
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.2'
+          channel: 'stable'
+      - name: Setup Ruby for Fastlane
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+          bundler-cache: true
+      - name: Get dependencies
+        working-directory: ./usr
+        run: flutter pub get
+      - name: Setup iOS certificates with Fastlane
+        run: |
+          echo "Setting up iOS certificates and profiles using Fastlane..."
+          
+          # Create a directory for certificate and credentials
+          mkdir -p ios_credentials
+          
+          # Save certificate to file
+          echo "${{ secrets.IOS_P12_CERTIFICATE_BASE64 }}" | base64 --decode > ios_credentials/distribution.p12
+          echo "${{ secrets.IOS_CERTIFICATE_PASSWORD }}" > ios_credentials/password.txt
+          
+          # Save App Store API credentials 
+          echo "${{ secrets.APP_STORE_CREDENTIALS_JSON }}" > ios_credentials/app_store_credentials.json
+          
+          # Create Fastlane configuration directory
+          mkdir -p ./usr/ios/fastlane
+          
+          # Generate Fastfile for iOS build and publish
+          cat > ./usr/ios/fastlane/Fastfile << 'EOF'
+          # Disable Fastlane's usage data collection
+          opt_out_usage
+          
+          default_platform(:ios)
+          
+          platform :ios do
+            desc "Build and publish iOS app"
+            lane :build_and_publish do
+              
+              # Setup temp keychain
+              keychain_name = "ios_build_keychain"
+              keychain_password = SecureRandom.base64
+              
+              begin
+                # Create and configure temporary keychain
+                create_keychain(
+                  name: keychain_name,
+                  password: keychain_password,
+                  default_keychain: true,
+                  unlock: true,
+                  timeout: 3600,
+                  lock_when_sleeps: false
+                )
+                
+                # Import certificate
+                certificate_path = "../../ios_credentials/distribution.p12"
+                certificate_password = File.read("../../ios_credentials/password.txt").strip
+                
+                import_certificate(
+                  certificate_path: certificate_path,
+                  certificate_password: certificate_password,
+                  keychain_name: keychain_name,
+                  keychain_password: keychain_password
+                )
+                
+                # Build the app
+                gym(
+                  workspace: "../ios/Runner.xcworkspace",
+                  scheme: "Runner",
+                  output_directory: "./build/ios/ipa",
+                  output_name: "app.ipa",
+                  export_method: "app-store",
+                  xcargs: "-allowProvisioningUpdates",
+                  include_symbols: true,
+                  include_bitcode: false,
+                  silent: false,
+                  clean: true
+                )
+                
+                # Upload to App Store Connect
+                api_key_info = JSON.parse(File.read('../../ios_credentials/app_store_credentials.json'))
+                api_key = app_store_connect_api_key(
+                  key_id: api_key_info['key_id'],
+                  issuer_id: api_key_info['issuer_id'],
+                  key_content: api_key_info['api_key'],
+                  in_house: false,
+                  is_key_content_base64: true
+                )
+                
+                upload_to_app_store(
+                  api_key: api_key,
+                  app_identifier: ENV["PACKAGE_NAME"] || "com.example.couldai_user_app",
+                  ipa: "./build/ios/ipa/app.ipa",
+                  skip_screenshots: true,
+                  skip_metadata: true,
+                  precheck_include_in_app_purchases: false,
+                  submit_for_review: false
+                )
+                
+              ensure
+                # Always delete the temporary keychain
+                delete_keychain(name: keychain_name) if File.exist?(File.expand_path("~/Library/Keychains/#{keychain_name}-db"))
+              end
+            end
+          end
+          EOF
+          
+      - name: Build and publish iOS app with Fastlane
+        working-directory: ./usr/ios
+        env:
+          PACKAGE_NAME: ${{ github.event.inputs.package_name }}
+        run: fastlane build_and_publish
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-release-build
+          path: ./usr/ios/build/ios/ipa/*.ipa
+          retention-days: 7
